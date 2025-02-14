@@ -1,0 +1,6 @@
+snowflake-connector-python
+sqlalchemy
+psycopg2-binary
+pandas
+python-dotenv
+tqdm
