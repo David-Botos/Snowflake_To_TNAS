@@ -41,38 +41,56 @@ class UUIDCleaner(CleaningOperation):
             return False
     
     def clean(self, value: Any, context: Dict) -> Tuple[str, Optional[Dict]]:
-        is_primary_key = context.get('is_primary_key', False)
+        """
+        Clean a value and ensure it's a valid UUID
         
-        # Handle null values
-        if pd.isna(value) or value is None:
+        Args:
+            value: The value to clean
+            context: Dict containing:
+                - schema_name: name of the schema
+                - table_name: name of the table
+                - row_identifier: the ID column value for this row
+                - column_name: name of the column being cleaned
+                - is_id_column: boolean indicating if this is the ID column
+        """
+        # Handle null/empty values
+        if pd.isna(value) or value is None or str(value).strip() == '':
             new_uuid = str(uuid.uuid4())
+            
+            # Different handling for ID column vs other UUID columns
+            cleaning_reason = 'missing_primary_key' if context.get('is_id_column') else 'null_uuid'
+            row_id = new_uuid if context.get('is_id_column') else context['row_identifier']
+            
             return new_uuid, {
                 'schema_name': context['schema_name'],
                 'table_name': context['table_name'],
+                'column_name': context['column_name'],
                 'original_value': None,
                 'new_value': new_uuid,
-                'row_identifier': context.get('row_identifier', new_uuid),
-                'cleaning_operation': 'uuid_replacement',
-                'cleaning_reason': 'null_uuid_primary_key' if is_primary_key else 'null_uuid'
+                'row_identifier': row_id,
+                'cleaning_operation': 'uuid_generation',
+                'cleaning_reason': cleaning_reason
             }
         
-        # Convert to string if not already
+        # Convert to string and check validity
         val_str = str(value).strip().lower()
-        
-        # Check if valid UUID v4
         if self.is_valid_uuid(val_str):
             return val_str, None
         
-        # Generate new UUID v4
+        # Generate new UUID for invalid value
         new_uuid = str(uuid.uuid4())
+        cleaning_reason = 'invalid_primary_key' if context.get('is_id_column') else 'invalid_uuid_format'
+        row_id = new_uuid if context.get('is_id_column') else context['row_identifier']
+        
         return new_uuid, {
             'schema_name': context['schema_name'],
             'table_name': context['table_name'],
+            'column_name': context['column_name'],
             'original_value': val_str,
             'new_value': new_uuid,
-            'row_identifier': context['row_identifier'],
-            'cleaning_operation': 'uuid_replacement',
-            'cleaning_reason': 'invalid_uuid_format'
+            'row_identifier': row_id,
+            'cleaning_operation': 'uuid_generation',
+            'cleaning_reason': cleaning_reason
         }
 
 class DataCleaner:
@@ -107,42 +125,39 @@ class DataCleaner:
     def clean_dataframe(self, df: pd.DataFrame, metadata: Dict, schema: str, table: str) -> Tuple[pd.DataFrame, List[Dict]]:
         """Clean a dataframe and track changes"""
         cleaning_records = []
-        primary_keys = [pk.lower() for pk in metadata['primary_keys']]
         
-        # First pass: Clean primary key columns to ensure we have valid IDs
-        for pk in primary_keys:
-            col_meta = next(c for c in metadata['columns'] if c['name'].lower() == pk.lower())
+        # First: Handle ID column
+        for idx, row in df.iterrows():
+            context = {
+                'schema_name': schema,
+                'table_name': table,
+                'column_name': 'ID',
+                'row_identifier': str(row['ID']) if not pd.isna(row['ID']) else None,
+                'is_id_column': True
+            }
             
-            # Clean primary key column
-            for idx, row in df.iterrows():
-                context = {
-                    'schema_name': schema,
-                    'table_name': table,
-                    'row_identifier': str(row[pk]) if not pd.isna(row[pk]) else None,
-                    'is_primary_key': True
-                }
-                
-                new_val, cleaning_record = self.uuid_cleaner.clean(row[pk], context)
-                df.at[idx, pk] = new_val
-                if cleaning_record:
-                    cleaning_records.append(cleaning_record)
+            new_val, cleaning_record = self.uuid_cleaner.clean(row['ID'], context)
+            df.at[idx, 'ID'] = new_val
+            if cleaning_record:
+                cleaning_records.append(cleaning_record)
         
-        # Second pass: Clean other UUID columns
+        # Then: Clean other UUID columns
         for col in df.columns:
-            if col.lower() in primary_keys:
+            if col == 'ID':
                 continue
                 
-            col_meta = next(c for c in metadata['columns'] if c['name'].upper() == col.upper())
+            col_meta = next(c for c in metadata['columns'] if c['name'] == col)
             
-            if (col.lower().endswith('_uuid') or col.lower() == 'uuid' or 
-                'uuid' in col_meta['data_type'].lower()):
+            if (col.endswith('_UUID') or col == 'UUID' or 
+                'UUID' in col_meta['data_type'].upper()):
                 
                 for idx, row in df.iterrows():
                     context = {
                         'schema_name': schema,
                         'table_name': table,
-                        'row_identifier': str(row[primary_keys[0]]),
-                        'is_primary_key': False
+                        'column_name': col,
+                        'row_identifier': str(row['ID']),
+                        'is_id_column': False
                     }
                     
                     new_val, cleaning_record = self.uuid_cleaner.clean(row[col], context)

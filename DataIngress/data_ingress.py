@@ -8,7 +8,9 @@ import logging
 from datetime import datetime
 from typing import Dict, List, Tuple, Any, Optional
 import re
+import traceback
 from ingress_cleaning import DataCleaner 
+
 
 # Load environment variables
 load_dotenv()
@@ -222,63 +224,36 @@ class TableManager:
             # Get column information using SHOW COLUMNS
             cur.execute(f"SHOW COLUMNS IN TABLE {schema}.{table}")
             columns = []
-            column_names = set()  # Track column names for case-sensitivity handling
+            column_names = set()
             
             for row in cur.fetchall():
-                name = row[2]  # Column name is in the 3rd position
-                data_type = row[3]  # Data type is in the 4th position
-                nullable = row[7].upper() == 'Y'  # Nullable flag is in the 8th position
+                name = row[2]  # Column name
+                data_type = row[3]  
+                nullable = row[7].upper() == 'Y'
                 
-                # Handle case-sensitive column names
-                orig_name = name
-                lower_name = name.lower()
-                if lower_name in column_names:
+                if name in column_names:
                     detail_log.warning(f"Duplicate column name found: {name} in {schema}.{table}")
                     continue
-                column_names.add(lower_name)
+                column_names.add(name)
                 
                 pg_type = self.type_converter.convert_snowflake_to_pg_type(data_type)
                 columns.append({
-                    'name': orig_name,
+                    'name': name,
                     'data_type': data_type,
                     'nullable': nullable,
                     'pg_type': pg_type
                 })
-            
-            # Get primary key information using SHOW PRIMARY KEYS
-            cur.execute(f"SHOW PRIMARY KEYS IN TABLE {schema}.{table}")
-            primary_keys = []
-            pk_results = cur.fetchall()
-            
-            if pk_results:
-                # Sort by key sequence to maintain proper order
-                sorted_pks = sorted(pk_results, key=lambda x: x[6])  # Key sequence is in the 7th position
-                primary_keys = [pk[4] for pk in sorted_pks]  # Column name is in the 5th position
-            
-            # If no primary keys found, check if 'id' column exists
-            if not primary_keys:
-                # Look for ID columns in priority order
-                id_columns = [
-                    col['name'] for col in columns 
-                    if col['name'].lower() in ['id', 'uuid', 'guid']
-                ]
+
+            # Check for ID column
+            if 'ID' not in column_names:
+                raise ValueError(f"Table {schema}.{table} does not have an ID column")
                 
-                if id_columns:
-                    primary_keys = [id_columns[0]]
-                    detail_log.info(f"Using {id_columns[0]} as primary key for {schema}.{table}")
-                else:
-                    # Create synthetic UUID primary key
-                    columns.insert(0, {
-                        'name': 'id',
-                        'data_type': 'TEXT',
-                        'nullable': False,
-                        'pg_type': 'TEXT'
-                    })
-                    primary_keys = ['id']
-                    detail_log.warning(f"No suitable ID column found for {schema}.{table}, creating UUID column 'id'")
-            
+            # Set ID as primary key
+            primary_keys = ['ID']
+            detail_log.info(f"Set ID as primary key for {schema}.{table}")
+                
             return {'columns': columns, 'primary_keys': primary_keys}
-        
+            
         except Exception as e:
             detail_log.error(f"Error getting metadata for {schema}.{table}: {str(e)}")
             raise
@@ -286,16 +261,17 @@ class TableManager:
             cur.close()
     
     def create_table(self, schema: str, table: str, metadata: Dict):
-        """Create table in PostgreSQL with proper primary key handling"""
+        """Create table in PostgreSQL with improved data quality"""
         columns = []
         for col in metadata['columns']:
-            # Make primary key columns non-nullable, everything else nullable
-            is_pk = col['name'].lower() in [pk.lower() for pk in metadata['primary_keys']]
-            nullable = "" if is_pk else "NULL"
-            columns.append(f"{col['name'].lower()} {col['pg_type']} {nullable}")
+            # Make ID column non-nullable and a primary key, all other columns nullable
+            if col['name'] == 'ID':
+                columns.append(f"{col['name']} {col['pg_type']} NOT NULL")
+            else:
+                columns.append(f"{col['name']} {col['pg_type']} NULL")
         
-        # Add primary key constraint
-        pk_clause = f", PRIMARY KEY ({', '.join(pk.lower() for pk in metadata['primary_keys'])})"
+        # Add primary key constraint on ID
+        pk_clause = ", PRIMARY KEY (ID)"
         
         create_table_sql = f"""
             CREATE TABLE {schema.lower()}.{table.lower()} (
@@ -306,10 +282,9 @@ class TableManager:
         
         with self.pg_conn.begin() as trans:
             trans.execute(sqlalchemy.text(f"CREATE SCHEMA IF NOT EXISTS {schema.lower()}"))
-            trans.execute(sqlalchemy.text(f"DROP TABLE IF EXISTS {schema.lower()}.{table.lower()}")
-            )
+            trans.execute(sqlalchemy.text(f"DROP TABLE IF EXISTS {schema.lower()}.{table.lower()}"))
             trans.execute(sqlalchemy.text(create_table_sql))
-            detail_log.info(f"Created table {schema.lower()}.{table.lower()}")
+            detail_log.info(f"Created table {schema.lower()}.{table.lower()} with ID as primary key")
 
 class DataTransfer:
     """Handle the data transfer process"""
@@ -324,16 +299,31 @@ class DataTransfer:
     
     def _process_chunk(self, df: pd.DataFrame, metadata: Dict, schema: str, table: str) -> Tuple[pd.DataFrame, List[Dict]]:
             """Process a chunk of data with proper type conversion and cleaning"""
-            # First apply type conversion
-            for col in df.columns:
-                col_meta = next(c for c in metadata['columns'] if c['name'].upper() == col.upper())
-                if not any(t in col.lower() for t in ['uuid']):  # Skip UUID columns for type conversion
-                    df[col] = df[col].apply(lambda x: self.type_converter.handle_null_value(x, col_meta['pg_type']))
-            
-            # Then apply data cleaning
-            df, cleaning_records = self.data_cleaner.clean_dataframe(df, metadata, schema, table)
-            
-            return df, cleaning_records
+            try:
+                # First apply type conversion
+                for col in df.columns:
+                    col_meta = next(c for c in metadata['columns'] if c['name'].upper() == col.upper())
+                    if not any(t in col.lower() for t in ['uuid']):  # Skip UUID columns for type conversion
+                        df[col] = df[col].apply(lambda x: self.type_converter.handle_null_value(x, col_meta['pg_type']))
+                
+                # Then apply data cleaning
+                df, cleaning_records = self.data_cleaner.clean_dataframe(df, metadata, schema, table)
+                
+                return df, cleaning_records
+            except Exception as e:
+                # Enhanced error logging
+                detail_log.error(f"""
+                    Error processing chunk for {schema}.{table}:
+                    Error type: {type(e).__name__}
+                    Error message: {str(e)}
+                    DataFrame info:
+                    {df.info()}
+                    DataFrame head:
+                    {df.head()}
+                    Metadata:
+                    {metadata}
+                """)
+                raise
 
     def transfer_table(self, schema: str, table: str) -> bool:
         """Transfer table data from Snowflake to PostgreSQL"""
@@ -341,13 +331,6 @@ class DataTransfer:
         table_key = f"{schema_name}.{table}"
         start_time = datetime.now()
         
-        # Initialize cursor before any operations that might fail
-        try:
-            snow_cur = self.snow_conn.cursor()
-        except Exception as e:
-            detail_log.error(f"Failed to create cursor for {table_key}: {str(e)}")
-            return False
-
         try:
             # Get metadata and create table
             metadata = self.table_manager.get_table_metadata(schema_name, table)
@@ -366,7 +349,7 @@ class DataTransfer:
             columns = [col['name'] for col in metadata['columns']]
             select_query = f"SELECT {', '.join(columns)} FROM {schema_name}.{table}"
             
-            # Transfer data in chunks with retry logic
+            # Transfer data in chunks
             snow_cur.execute(select_query)
             
             with tqdm(total=total_rows, desc=f"Transferring {table_key}") as pbar:
@@ -378,40 +361,53 @@ class DataTransfer:
                     # Convert chunk to DataFrame
                     df = pd.DataFrame(chunk, columns=columns)
                     
-                    # Process chunk with retries
-                    for attempt in range(self.retry_attempts):
-                        try:
-                            processed_df, cleaning_records = self._process_chunk(
-                                df.copy(), 
-                                metadata,
-                                schema,
-                                table
-                            )
-                            
-                            with self.pg_conn.begin() as conn:
-                                # Insert the processed data
+                    try:
+                        processed_df, cleaning_records = self._process_chunk(
+                            df.copy(), 
+                            metadata,
+                            schema,
+                            table
+                        )
+                        
+                        insert_sql = f"""
+                            INSERT INTO {schema.lower()}.{table.lower()} 
+                            ({', '.join(col.lower() for col in columns)})
+                            VALUES ({', '.join([':' + col for col in columns])})
+                        """
+                        
+                        with self.pg_conn.begin() as conn:
+                            try:
                                 conn.execute(
-                                    sqlalchemy.text(
-                                        f"""
-                                        INSERT INTO {schema.lower()}.{table.lower()} 
-                                        ({', '.join(col.lower() for col in columns)})
-                                        VALUES ({', '.join([':' + col for col in columns])})
-                                        """
-                                    ),
+                                    sqlalchemy.text(insert_sql),
                                     processed_df.to_dict('records')
                                 )
-                                
-                                # Record any cleaning operations
-                                if cleaning_records:
-                                    self.data_cleaner.record_cleaning(cleaning_records)
-                                    detail_log.info(f"Recorded {len(cleaning_records)} cleaning operations for chunk in {table_key}")
-                            
-                            break
-                        except Exception as e:
-                            if attempt == self.retry_attempts - 1:
+                            except Exception as e:
+                                detail_log.error(f"""
+                                    SQL execution failed for {table_key}:
+                                    Error type: {type(e).__name__}
+                                    Error message: {str(e)}
+                                    SQL: {insert_sql}
+                                    First row sample:
+                                    {processed_df.iloc[0].to_dict() if not processed_df.empty else 'Empty DataFrame'}
+                                    DataFrame info:
+                                    {processed_df.info()}
+                                """)
                                 raise
-                            detail_log.warning(f"Retry {attempt + 1} for chunk in {table_key}: {str(e)}")
-                            continue
+                            
+                            # Record any cleaning operations
+                            if cleaning_records:
+                                self.data_cleaner.record_cleaning(cleaning_records)
+                                detail_log.info(f"Recorded {len(cleaning_records)} cleaning operations for chunk in {table_key}")
+                    
+                    except Exception as e:
+                        detail_log.error(f"""
+                            Failed to process chunk for {table_key}:
+                            Error type: {type(e).__name__}
+                            Error message: {str(e)}
+                            Traceback:
+                            {traceback.format_exc()}
+                        """)
+                        raise
                     
                     pbar.update(len(chunk))
             
